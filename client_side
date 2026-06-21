@@ -1,0 +1,176 @@
+import time
+import threading
+import requests
+import subprocess
+import speech_recognition as sr
+import RPi.GPIO as GPIO
+import cv2
+import numpy as np
+import serial
+from smbus2 import SMBus
+from scipy.signal import find_peaks
+import firebase_admin
+from firebase_admin import credentials, firestore
+from datetime import datetime
+from picamera2 import Picamera2
+
+# ================= GPIO SETUP =================
+MODE_SWITCH = 17
+EXIT_SWITCH = 27
+SHUTDOWN_SWITCH = 22
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(MODE_SWITCH, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(EXIT_SWITCH, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(SHUTDOWN_SWITCH, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+# ================= FIREBASE =================
+cred = credentials.Certificate("Firebase_key.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+DOC_PATH = "devices/glass-001"
+
+def update_firestore(data):
+    data["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.document(DOC_PATH).set(data, merge=True)
+
+# ================= SPEECH =================
+def speak(text):
+    subprocess.Popen(["espeak", "-s", "135", "-a", "200", text])
+
+# ================= CAMERA =================
+picam2 = Picamera2()
+picam2.configure(
+    picam2.create_preview_configuration(
+        main={"size": (320, 240), "format": "RGB888"}
+    )
+)
+picam2.start()
+# ================= GLOBAL MODE =================
+current_mode = None
+SERVER_URL = "https://vortiginous-artistically-sabina.ngrok-free.dev/process"
+IMAGE_PATH = "captured.jpg"
+
+# ================= VOICE =================
+MIC_INDEX = 0  # <-- USB microphone index
+
+def listen_for_mode():
+    r = sr.Recognizer()
+    with sr.Microphone(device_index=MIC_INDEX) as source:
+        speak("Listening")
+        r.adjust_for_ambient_noise(source, duration=0.5)
+        audio = r.listen(source, timeout=5)
+
+    try:
+        cmd = r.recognize_google(audio).lower()
+
+        if "read" in cmd:
+            return "reading"
+        elif "object" in cmd:
+            return "object"
+        elif "face" in cmd:
+            return "face"
+        elif "obstacle" in cmd:
+            return "obstacle"
+    except:
+        pass
+    return None
+    # ================= OBSTACLE DETECTION =================
+def obstacle_mode():
+    speak("Obstacle mode")
+
+    plain_history = []
+    while current_mode == "obstacle":
+        frame = picam2.capture_array()
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 80, 150)
+
+        ratio = 1 - (np.count_nonzero(edges) / edges.size)
+        plain_history.append(ratio)
+        if len(plain_history) > 10:
+            plain_history.pop(0)
+
+        avg_ratio = np.mean(plain_history)
+
+        if avg_ratio > 0.94:
+            speak("Obstacle detected")
+            update_firestore({"obstacle": True})
+            time.sleep(2)
+
+        time.sleep(0.05)
+        # ================= SERVER MODES =================
+def server_mode():
+    global current_mode
+
+    speak(current_mode + " mode")
+
+    while current_mode in ["reading", "object", "face"]:
+        picam2.capture_file(IMAGE_PATH)
+
+        with open(IMAGE_PATH, "rb") as img:
+            response = requests.post(
+                SERVER_URL,
+                files={"image": img},
+                data={"mode": current_mode},
+                timeout=60
+            )
+
+        if response.status_code == 200:
+            result = response.json()
+            if current_mode == "reading":
+                speak(result.get("text", "No text"))
+
+            elif current_mode == "object":
+                objs = result.get("objects", [])
+                speak(", ".join(objs) if objs else "No objects")
+
+            elif current_mode == "face":
+                faces = result.get("faces", [])
+                speak(", ".join(faces) if faces else "No face")
+
+        time.sleep(2)
+        # ================= SENSOR THREAD =================
+def sensor_thread():  
+    gps = serial.Serial('/dev/serial0', baudrate=9600, timeout=0.5)
+    bus = SMBus(1)
+    ADDR = 0x57
+
+    last_upload = 0
+
+    while True:
+        if time.time() - last_upload > 2:
+            update_firestore({"status": "running"})
+            last_upload = time.time()
+        time.sleep(0.1)
+# ================= MODE MANAGER =================
+def mode_manager():
+    global current_mode
+
+    while True:
+
+        if GPIO.input(SHUTDOWN_SWITCH):
+            speak("Shutting down")
+            break
+
+        if GPIO.input(EXIT_SWITCH):
+            current_mode = None
+            speak("Exiting mode")
+            time.sleep(1)
+
+        if GPIO.input(MODE_SWITCH):
+            mode = listen_for_mode()
+            if mode:
+                current_mode = mode
+                if mode == "obstacle":
+                    obstacle_mode()
+                else:
+                    server_mode()
+
+        time.sleep(0.1)
+
+# ================= START THREADS =================
+threading.Thread(target=sensor_thread, daemon=True).start()
+mode_manager()
+
+GPIO.cleanup()
+picam2.stop()
